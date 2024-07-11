@@ -22,19 +22,20 @@ import csv
 from pprint import pprint
 
 # Battery claimed parameters
-nominal_capacity = 850 # mAh
+nominal_capacity = 780 # mAh
 charge_voltage = 4.2 # V
-charge_rate = 1 # C
-charge_termination = 0.1 # times the charge rate
+charge_rate = 0.5 # C
+charge_termination = 0.1 # times the charge rate. MCP7383x is available from C/5 (0.2) to C/20 (0.05), TP4056 is C/10 (0.1)
 
 # Test conditions
-discharge_rate = 0.1 # C
-pulse_discharge_rate = 1 # C
-pulse_settle_time = 3 # seconds
-pulse_spacing = 60 # seconds
-discharge_termination = 3.0 # V at the nominal discharge rate
+discharge_rate = 0.25 # C
+pulse_discharge_rate = 0.5 # C
+pulse_settle_time = 2 # seconds
+pulse_spacing = 120 # seconds
+discharge_termination = 2.8 # V at the nominal discharge rate
 number_of_cycles = 1
-
+rest_charge_to_discharge = 60 * 5 # seconds
+rest_discharge_to_charge = 60 * 5 # seconds
 
 # Derived parameters
 charge_current = nominal_capacity * charge_rate / 1000 # A
@@ -43,8 +44,8 @@ discharge_current = nominal_capacity * discharge_rate / 1000 # A
 pulse_discharge_current = nominal_capacity * pulse_discharge_rate / 1000 # A
 
 # Misc configuration
-psu_ip = "192.168.1.114"
-load_ip = "192.168.1.116"
+psu_ip = "10.0.0.10"
+load_ip = "10.0.0.11"
 
 def log_to_file(samples, filename):
     fieldnames = samples[0].keys()
@@ -56,6 +57,10 @@ def log_to_file(samples, filename):
 
 
 def charge_cycle(psu, fname):
+
+    # TODO: Trickle charging when low voltage?
+    
+    failed = False
 
     try:
         # Charge with a constant-voltage, current limited to the charge rate
@@ -122,6 +127,7 @@ def charge_cycle(psu, fname):
     
     except Exception as e:
         print(f"Exception: {e}")
+        failed=True
     finally:
         psu.CH2.set_output(False)
         print("Finally, PSU output off")
@@ -133,9 +139,12 @@ def charge_cycle(psu, fname):
         estimated_charge_mah = estimated_charge / 3600 * 1000
         print(f"Estimated charge taken this cycle: {estimated_charge_mah} mAh (coulombs: {estimated_charge})")
 
+    return not failed
 
 def discharge_cycle(load, fname):
     print("Starting discharge cycle...")
+
+    failed=False
 
     # Log the current and voltage at the start of the discharge cycle
     start_time = time.time()
@@ -214,6 +223,9 @@ def discharge_cycle(load, fname):
                 # Return to the nominal discharge rate
                 load.set_source_current(discharge_current)
 
+                # Prevent the coulomb counting from adding at the nominal rate for the duration of the pulse
+                last_sample_time = time.time()
+
 
             # Once per minute, save the data to disk for later analysis
             if time.time() - last_save_time > 60:
@@ -221,8 +233,10 @@ def discharge_cycle(load, fname):
                 print(f"Saved backup data to {fname}")
                 last_save_time = time.time()
 
-            # If the voltage has dropped below the termination voltage, terminate the discharge
-            if voltage < discharge_termination:
+            # If the average voltage over the last N samples has dropped below the termination voltage, terminate the discharge
+            # This improves noise/pulse-loading immunity and makes the termination more predictable
+            num_samples_required = 20
+            if len(samples) >= num_samples_required and sum([sample['voltage'] for sample in samples[-num_samples_required:]]) / num_samples_required < discharge_termination:
                 print("Discharge terminated due to cutoff voltage")
                 break
 
@@ -234,6 +248,7 @@ def discharge_cycle(load, fname):
 
     except Exception as e:
         print(f"Exception: {e}")
+        failed=True
     finally:
         load.set_source_state(False)
         print("Finally, load output off")
@@ -247,17 +262,48 @@ def discharge_cycle(load, fname):
         log_to_file(samples, fname)
         print(f"Saved data to {fname}")
 
+    return not failed
+
 
 with spd3303x.SPD3303X.ethernet_device(psu_ip) as psu, sdl1030x.SDL1030X.ethernet_device(load_ip) as load:
 
     # File name chosen based on the current date and time
     identifier = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    print("Charging...")
-    charge_cycle(psu, f"charge_{identifier}.csv")
+    # Collect any information that might be useful for later analysis
+    user_info = input("Enter any information that might be useful for later analysis: ")
 
-    time.sleep(5)
-    
-    print("Discharging...")
-    discharge_cycle(load, f"discharge_{identifier}.csv")
+    with open(f"info_{identifier}.txt", "w") as f:
+        # Log all the key parameters to a text file for later reference
+        f.write(f"Test started at {datetime.datetime.now()}\n")
+        f.write(f"User info: {user_info}\n")
+        f.write(f"Identifier: {identifier}\n")
+        f.write(f"Nominal capacity: {nominal_capacity} mAh\n")
+        f.write(f"Charge voltage: {charge_voltage} V\n")
+        f.write(f"Charge rate: {charge_rate} C\n")
+        f.write(f"Charge termination: {charge_termination} C\n")
+        f.write(f"Discharge rate: {discharge_rate} C\n")
+        f.write(f"Pulse discharge rate: {pulse_discharge_rate} C\n")
+        f.write(f"Pulse settle time: {pulse_settle_time} s\n")
+        f.write(f"Pulse spacing: {pulse_spacing} s\n")
+        f.write(f"Number of cycles: {number_of_cycles}\n")
+        f.write(f"Rest time between charge and discharge: {rest_charge_to_discharge} s\n")
+
+    for cycle in range(1, number_of_cycles+1):
+        
+        print(f"Charge cycle {cycle}...")
+        if not charge_cycle(psu, f"charge_cycle{cycle}_{identifier}.csv"):
+            print("Charge cycle failed!")
+            break
+
+        print(f"Resting between charge and discharge...")
+        time.sleep(rest_charge_to_discharge)
+        
+        print(f"Discharge cycle {cycle}...")
+        if not discharge_cycle(load, f"discharge_cycle{cycle}_{identifier}.csv"):
+            print("Discharge cycle failed!")
+            break
+
+        print(f"Resting between discharge and charge...")
+        time.sleep(rest_discharge_to_charge)
 
