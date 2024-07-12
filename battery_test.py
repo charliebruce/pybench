@@ -20,6 +20,7 @@ import time
 import datetime
 import csv
 from pprint import pprint
+import traceback
 
 # Battery claimed parameters
 nominal_capacity = 780 # mAh
@@ -127,6 +128,7 @@ def charge_cycle(psu, fname):
     
     except Exception as e:
         print(f"Exception: {e}")
+        traceback.print_exc()
         failed=True
     finally:
         psu.CH2.set_output(False)
@@ -248,6 +250,7 @@ def discharge_cycle(load, fname):
 
     except Exception as e:
         print(f"Exception: {e}")
+        traceback.print_exc()
         failed=True
     finally:
         load.set_source_state(False)
