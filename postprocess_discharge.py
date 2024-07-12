@@ -58,19 +58,19 @@ print(f"Measured resistance: {nominal_resistance}")
 # From the normal discharge samples, the rate used for the discharge, we can calculate the open-circuit voltage for each sample
 ocvs = [x["voltage"] + x["current"] * nominal_resistance for x in discharge_data]
 
-# Take N evenly-spaced samples from the OCV data, and output as a C-style array, from 0 to 100% SOC
+# Take N evenly-spaced samples from the OCV data, and output as a C-style array
 N = 20
 
 indices = [int(i * (len(ocvs) - 1) / N) for i in range(N + 1)]
 
-# Sanity check: first entry should be 0% SOC, last entry should be 100% SOC
+# Sanity check: ensure we capture the entire range
 assert indices[0] == 0
 assert indices[-1] == len(ocvs) - 1
 
 ocv_samples = [ocvs[i] for i in indices]
 
-print("float ocv_samples[] = {", end="")
-print(", ".join([f"{x:.4f}f" for x in ocv_samples]), end="")
+print("const float ocv_samples[] = {", end="")
+print(", ".join([f"{x:.4f}f" for x in ocv_samples[::-1]]), end="") # Reverse the order so that 0% SOC is at the start
 print("};")
 
 #
