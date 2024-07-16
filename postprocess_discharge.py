@@ -10,7 +10,7 @@ import sys
 
 # Load the data from the named file
 fname = sys.argv[1]
-discharge_rate = float(sys.argv[2])
+discharge_rate_amps = float(sys.argv[2])
 with open(fname, "r") as f:
     reader = csv.DictReader(f)
     # time, voltage, current, charge are all floats, parsed as such
@@ -85,7 +85,7 @@ print(f"Measured capacity: {capacity_mah:.1f} mAh.")
 # As a sanity check, we can calculate the capacity by taking the nominal discharge rate and multiplying by the time
 start_time = discharge_data[0]["time"]
 end_time = discharge_data[-1]["time"]
-sanity_check_coulombs = discharge_rate * (end_time - start_time)
+sanity_check_coulombs = discharge_rate_amps * (end_time - start_time) # 1 coulomb = 1 ampere-second
 print(f"Sanity check capacity (under-estimate due to pulses): {sanity_check_coulombs / 3600 * 1000 :.1f} mAh.")
 
 
