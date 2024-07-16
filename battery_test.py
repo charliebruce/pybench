@@ -14,7 +14,7 @@
 
 # For now let's ignore dynamic recovery, temperature, and non-linear effects.
 
-import spd3303x
+import dp8xx
 import sdl1030x
 import time
 import datetime
@@ -70,7 +70,7 @@ def charge_cycle(psu, fname):
   
         psu.CH2.set_output(True)
         start_time = time.time()
-
+        time.sleep(1) # Allow the PSU to start up
         print(f"Charging begun, will log to {fname}")
 
         samples = []
@@ -268,7 +268,7 @@ def discharge_cycle(load, fname):
     return not failed
 
 
-with spd3303x.SPD3303X.ethernet_device(psu_ip) as psu, sdl1030x.SDL1030X.ethernet_device(load_ip) as load:
+with dp8xx.DP8xx.ethernet_device(psu_ip) as psu, sdl1030x.SDL1030X.ethernet_device(load_ip) as load:
 
     # File name chosen based on the current date and time
     identifier = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
