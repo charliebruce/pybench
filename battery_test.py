@@ -19,31 +19,30 @@ import sdl1030x
 import time
 import datetime
 import csv
-from pprint import pprint
 import traceback
+import tqdm
 
-# Battery claimed parameters
-nominal_capacity = 780 # mAh
-charge_voltage = 4.2 # V
-charge_rate = 0.5 # C
-charge_termination = 0.1 # times the charge rate. MCP7383x is available from C/5 (0.2) to C/20 (0.05), TP4056 is C/10 (0.1)
+# Battery parameters
+import spec_velo2_4v35 as spec
 
-# Test conditions
-discharge_rate = 0.25 # C
-pulse_discharge_rate = 0.5 # C
+# Test parameters not specified in the datasheet
+pulse_discharge_current = 2 * spec.discharge_current
 pulse_settle_time = 2 # seconds
 pulse_spacing = 120 # seconds
-discharge_termination = 2.8 # V at the nominal discharge rate
-number_of_cycles = 1
+number_of_cycles = 2
 rest_charge_to_discharge = 60 * 5 # seconds
 rest_discharge_to_charge = 60 * 5 # seconds
 
-# Derived parameters
-charge_current = nominal_capacity * charge_rate / 1000 # A
-charge_termination_current = charge_current * charge_termination # A
-discharge_current = nominal_capacity * discharge_rate / 1000 # A
-pulse_discharge_current = nominal_capacity * pulse_discharge_rate / 1000 # A
+# Misc calibration
+test_lead_resistance = 0.05 # measured by short circuiting the leads, putting a known current through, and measuring the voltage drop
 
+def mah_to_coulombs(mah):
+    # one milliamp hour is 1/1000 of an amp for 3600 seconds
+    return mah / 1000 * 3600
+def coulombs_to_mah(coulombs):
+    # one coulomb is one ampere-second
+    return coulombs / 3600 * 1000
+    
 # Misc configuration
 psu_ip = "10.0.0.10"
 load_ip = "10.0.0.11"
@@ -65,12 +64,20 @@ def charge_cycle(psu, fname):
 
     try:
         # Charge with a constant-voltage, current limited to the charge rate
-        psu.CH2.set_voltage(charge_voltage)
-        psu.CH2.set_current(charge_current)
+        # CH1 is used to control a relay which connects the PSU to the battery
+        # CH2 is used to charge the battery
+        # The reason a relay is used is because the PSU has an approx 38mA leakage current in to its supply when off
+        # which would affect the discharge measurements. 
+        # This could alternatively be reduced to a ~1mA output by setting to 4.2v 0.0001A, but the relay guarantees 0 leakage.
+        psu.CH1.set_voltage(12) # Relay control voltage
+        psu.CH1.set_current(1)
+        psu.CH2.set_voltage(spec.charge_voltage)
+        psu.CH2.set_current(spec.charge_current)
   
-        psu.CH2.set_output(True)
+        psu.CH1.set_output(True) # Power the relay
+        time.sleep(1) # Allow the relay to switch
+        psu.CH2.set_output(True) # Turn on the charger output
         start_time = time.time()
-        time.sleep(1) # Allow the PSU to start up
         print(f"Charging begun, will log to {fname}")
 
         samples = []
@@ -78,13 +85,21 @@ def charge_cycle(psu, fname):
         last_sample_time = start_time
         estimated_charge = 0
 
+        progbar = tqdm.tqdm(total=spec.nominal_capacity_mah, unit="mAh", unit_scale=True, desc="Charge starting...")
+        progbar.update(0)
+
+        time.sleep(1) # Allow the PSU to start up before entering the loop
+
         # Monitor and log the voltage and current
         while True:
             now = time.time()
             dt = now - last_sample_time
             last_sample_time = now
-            voltage = float(psu.CH2.measure_voltage())
-            current = float(psu.CH2.measure_current())
+
+            cur_values = psu.CH2.measure_all()
+            
+            voltage = cur_values['voltage']
+            current = cur_values['current']
             estimated_charge += current * dt
 
             sample = {
@@ -92,26 +107,28 @@ def charge_cycle(psu, fname):
                 'voltage': voltage,
                 'current': current,
                 'charge': estimated_charge, 
-                'status': "charging"}
-            
-            pprint(sample)
-
+                'status': "charging"
+            }
             samples.append(sample)
+
+            # Show a status line and progress bar in the console
+            charge_mah = coulombs_to_mah(estimated_charge)            
+            progbar.n = min(charge_mah, spec.nominal_capacity_mah) # prevent the progress bar from going over the nominal capacity
+            progbar.set_description(f"Charging: {current*1000:.1f}mA, {voltage:.3f}V, {charge_mah:.1f}mAh")
             
             # Terminate charge when current drops below the charge termination rate
-            if current < charge_termination_current:
-                print(f"Terminating charge due to cutoff current reached, charged for {time.time() - start_time} seconds")
+            if current < spec.charge_termination_current:
+                print(f"\nTerminating charge due to cutoff current reached, charged for {time.time() - start_time} seconds")
                 break
 
             # For safety, terminate charge after 3 hours regardless of current
             if time.time() - start_time > 3 * 3600:
-                print(f"Terminating charge due to timeout, charged for {time.time() - start_time} seconds")
+                print(f"\nTerminating charge due to timeout, charged for {time.time() - start_time} seconds")
                 break
 
             # Every minute, save the data to disk for later analysis
             if time.time() - last_save_time > 60:
                 log_to_file(samples, fname)
-                print(f"Saved backup data to {fname}")
                 last_save_time = time.time()
 
             # There will be a small delay due to the time it takes to measure, serialise, and save the data.
@@ -121,25 +138,28 @@ def charge_cycle(psu, fname):
                 time.sleep(delay)
 
 
-        psu.CH2.set_output(False)
-        print("Charge complete")
+        psu.CH1.set_output(False) # Disconnect the relay
+        #psu.CH2.set_output(False)
+        psu.CH2.set_current(0) # Temporary workaround for the PSU leakage current issue
+        print("\nCharge complete")
 
         
     
     except Exception as e:
-        print(f"Exception: {e}")
+        print(f"\nException: {e}")
         traceback.print_exc()
         failed=True
     finally:
-        psu.CH2.set_output(False)
-        print("Finally, PSU output off")
+        psu.CH1.set_output(False) # Disconnect the relay
+        #psu.CH2.set_output(False)
+        psu.CH2.set_current(0) # Temporary workaround for the PSU leakage current issue
+        print("\nFinally, PSU output zeroed. FIX ME: DISABLE PSU ONCE RELAY IS ADDED.")
         # Log to a file
         log_to_file(samples, fname)
         print(f"Saved data to {fname}")
 
         # Coulomb output
-        estimated_charge_mah = estimated_charge / 3600 * 1000
-        print(f"Estimated charge taken this cycle: {estimated_charge_mah} mAh (coulombs: {estimated_charge})")
+        print(f"Estimated charge taken this cycle: {coulombs_to_mah(estimated_charge)} mAh (coulombs: {estimated_charge})")
 
     return not failed
 
@@ -158,8 +178,11 @@ def discharge_cycle(load, fname):
 
     try:
 
+        progbar = tqdm.tqdm(total=spec.nominal_capacity_mah, unit="mAh", unit_scale=True, desc="Discharge starting...")
+        progbar.update(0)
+
         # Discharge at the nominal rate
-        load.set_source_current(discharge_current)
+        load.set_source_current(spec.discharge_current)
         load.set_source_state(True)
         time.sleep(1)
 
@@ -180,7 +203,12 @@ def discharge_cycle(load, fname):
                 'status': "discharge"
             }
             samples.append(sample)
-            pprint(sample)
+            
+            # Show a status line and progress bar in the console
+            charge_mah = coulombs_to_mah(estimated_charge)
+            progbar.n = min(charge_mah, spec.nominal_capacity_mah) # prevent the progress bar from going over the nominal capacity
+            progbar.set_description(f"Discharging: {current*1000:.1f}mA, {voltage:.3f}V, {charge_mah:.1f}mAh")
+
 
             # Estimate charge based on the current and time. Trapezioidal rule would be more accurate but this is fine
             estimated_charge += current * dt
@@ -190,7 +218,7 @@ def discharge_cycle(load, fname):
                 last_pulse_time = time.time()
 
                 # Increase the current to the pulse rate
-                print(f"Pulse discharge at {pulse_discharge_current}")
+                progbar.set_description(f"Discharge pulse: {pulse_discharge_current*1000:.1f}mA...")
                 load.set_source_current(pulse_discharge_current)
 
                 # Wait for the current to stabilise
@@ -207,10 +235,8 @@ def discharge_cycle(load, fname):
                 # Let's assume linear behaviour for now
                 # Vnominal = Vinternal - Inominal * Rinternal and Vpulse = Vinternal - Ipulse * Rinternal
                 # Rinternal = (Vnominal - Vpulse) / (Ipulse - Inominal)
-                resistance = (voltage - pulse_voltage) / (pulse_current - discharge_current)
+                resistance = (voltage - pulse_voltage) / (pulse_current - spec.discharge_current)
                 
-                print(f"Internal resistance estimate: {resistance}")
-
                 pulse_sample = {
                     'time': last_sample_time - start_time,
                     'voltage': pulse_voltage,
@@ -220,10 +246,9 @@ def discharge_cycle(load, fname):
                     'status': "discharge_pulse"
                 }
                 samples.append(pulse_sample)
-                pprint(pulse_sample)
 
                 # Return to the nominal discharge rate
-                load.set_source_current(discharge_current)
+                load.set_source_current(spec.discharge_current)
 
                 # Prevent the coulomb counting from adding at the nominal rate for the duration of the pulse
                 last_sample_time = time.time()
@@ -232,14 +257,13 @@ def discharge_cycle(load, fname):
             # Once per minute, save the data to disk for later analysis
             if time.time() - last_save_time > 60:
                 log_to_file(samples, fname)
-                print(f"Saved backup data to {fname}")
                 last_save_time = time.time()
 
             # If the average voltage over the last N samples has dropped below the termination voltage, terminate the discharge
             # This improves noise/pulse-loading immunity and makes the termination more predictable
             num_samples_required = 20
-            if len(samples) >= num_samples_required and sum([sample['voltage'] for sample in samples[-num_samples_required:]]) / num_samples_required < discharge_termination:
-                print("Discharge terminated due to cutoff voltage")
+            if len(samples) >= num_samples_required and sum([sample['voltage'] for sample in samples[-num_samples_required:]]) / num_samples_required < spec.discharge_termination_voltage:
+                print("\nDischarge terminated due to cutoff voltage")
                 break
 
             # Run the update loop every second
@@ -249,17 +273,16 @@ def discharge_cycle(load, fname):
             
 
     except Exception as e:
-        print(f"Exception: {e}")
+        print(f"\nException: {e}")
         traceback.print_exc()
         failed=True
     finally:
         load.set_source_state(False)
-        print("Finally, load output off")
+        print("\nFinally, load output off")
 
         # We work in coulombs (amp-seconds) but milliamp-hours is a more useful unit for batteries
         # 
-        estimated_charge_mah = estimated_charge / 3600 * 1000
-        print(f"Estimated charge this cycle: {estimated_charge_mah} mAh (coulombs: {estimated_charge})")
+        print(f"Estimated charge this cycle: {coulombs_to_mah(estimated_charge)} mAh (coulombs: {estimated_charge})")
 
         # Log to a file
         log_to_file(samples, fname)
@@ -270,23 +293,30 @@ def discharge_cycle(load, fname):
 
 with dp8xx.DP8xx.ethernet_device(psu_ip) as psu, sdl1030x.SDL1030X.ethernet_device(load_ip) as load:
 
+    # Estimate the total runtime as a rough guide
+    # Below is in units of amps, seconds
+    cycle_time = (mah_to_coulombs(spec.nominal_capacity_mah) / spec.discharge_current) + (mah_to_coulombs(spec.nominal_capacity_mah) / spec.charge_current) + rest_charge_to_discharge + rest_discharge_to_charge
+    total_time = cycle_time * number_of_cycles
+    print(f"Estimated runtime per cycle: {cycle_time/3600:.1f} hours, total runtime: {total_time/3600:.1f} hours")
+
     # File name chosen based on the current date and time
     identifier = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Collect any information that might be useful for later analysis
+    slug = input("Enter a short description of the battery (will be the start of the filename): ")
     user_info = input("Enter any information that might be useful for later analysis: ")
 
-    with open(f"info_{identifier}.txt", "w") as f:
+    with open(f"{slug}_{identifier}_info.txt", "w") as f:
         # Log all the key parameters to a text file for later reference
         f.write(f"Test started at {datetime.datetime.now()}\n")
         f.write(f"User info: {user_info}\n")
         f.write(f"Identifier: {identifier}\n")
-        f.write(f"Nominal capacity: {nominal_capacity} mAh\n")
-        f.write(f"Charge voltage: {charge_voltage} V\n")
-        f.write(f"Charge rate: {charge_rate} C\n")
-        f.write(f"Charge termination: {charge_termination} C\n")
-        f.write(f"Discharge rate: {discharge_rate} C\n")
-        f.write(f"Pulse discharge rate: {pulse_discharge_rate} C\n")
+        f.write(f"Nominal capacity: {spec.nominal_capacity_mah} mAh\n")
+        f.write(f"Charge voltage: {spec.charge_voltage} V\n")
+        f.write(f"Charge current: {spec.charge_current*1000:.1f} mA\n")
+        f.write(f"Charge termination: {spec.charge_termination_current*1000:.1f} mA\n")
+        f.write(f"Discharge current: {spec.discharge_current*1000:.1f} mA\n")
+        f.write(f"Pulse discharge current: {pulse_discharge_current*1000:.1f} mA\n")
         f.write(f"Pulse settle time: {pulse_settle_time} s\n")
         f.write(f"Pulse spacing: {pulse_spacing} s\n")
         f.write(f"Number of cycles: {number_of_cycles}\n")
@@ -295,7 +325,7 @@ with dp8xx.DP8xx.ethernet_device(psu_ip) as psu, sdl1030x.SDL1030X.ethernet_devi
     for cycle in range(1, number_of_cycles+1):
         
         print(f"Charge cycle {cycle}...")
-        if not charge_cycle(psu, f"charge_cycle{cycle}_{identifier}.csv"):
+        if not charge_cycle(psu, f"{slug}_chg{cycle}_{identifier}.csv"):
             print("Charge cycle failed!")
             break
 
@@ -303,10 +333,13 @@ with dp8xx.DP8xx.ethernet_device(psu_ip) as psu, sdl1030x.SDL1030X.ethernet_devi
         time.sleep(rest_charge_to_discharge)
         
         print(f"Discharge cycle {cycle}...")
-        if not discharge_cycle(load, f"discharge_cycle{cycle}_{identifier}.csv"):
+        if not discharge_cycle(load, f"{slug}_dis{cycle}_{identifier}.csv"):
             print("Discharge cycle failed!")
             break
 
         print(f"Resting between discharge and charge...")
         time.sleep(rest_discharge_to_charge)
 
+    # Finally turn off all the hardware
+    psu.CH1.set_output(False)
+    psu.CH2.set_output(False)
